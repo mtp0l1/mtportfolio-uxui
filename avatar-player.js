@@ -1,0 +1,196 @@
+/* Avatar com balão de fala em pixel art que toca a playlist.
+ *
+ * Estado:  isPinned = false
+ *   mouseenter (avatar)  -> se !isPinned: toca e mostra o balão
+ *   mouseleave (avatar)  -> se !isPinned: pausa e esconde o balão (se isPinned, segue tocando)
+ *   click      (avatar)  -> !isPinned: fixa (isPinned = true) | isPinned: desfixa, pausa e esconde
+ *
+ * Dois motores com a mesma interface { play(), pause(), onTrack(cb), onFail(cb) }:
+ *   - PreviewEngine : HTMLAudioElement com as prévias de 30 s (play/pause instantâneo)
+ *   - SpotifyEngine : Spotify IFrame API, controlada por código, iframe invisível
+ * O PreviewEngine é o padrão. Se uma prévia falhar, troca sozinho para o Spotify.
+ */
+(function () {
+  "use strict";
+
+  var CONFIG = {
+    engine: "spotify", // "spotify" = música inteira | "preview" = prévia de 30 s (usada se o Spotify falhar)
+    playlistId: "6ZJb7zsFDa3L7acRCyCYdl",
+    volume: 0.7,
+    // Passou desse tempo sem tocar nada, a próxima visita volta para a primeira faixa.
+    resetAfterMs: 6 * 60 * 60 * 1000,
+    // Faixas da playlist, na ordem dela (lidas do embed público). previewUrl = prévia de 30 s, só para reserva.
+    tracks: [
+      { artist: "Malphino", song: "The Sleep Tree", uri: "spotify:track:47Rs9xMHgO16kH3RGW0rrY", previewUrl: "https://p.scdn.co/mp3-preview/c7bf660278ec1d47cbef3c54ac4c2be14af6e756" },
+      { artist: "Childish Gambino, Khruangbin", song: "Happy Survival (feat. Khruangbin)", uri: "spotify:track:0Ck3kW2KiRLjMOGiKzW3la", previewUrl: "https://p.scdn.co/mp3-preview/b03acb09df90d9c84a92e1661f9d6383aca8c4e0" },
+      { artist: "Luiz Bonfá", song: "Bonfá Nova", uri: "spotify:track:2AxgMk9MTODVUao5uQcTSk", previewUrl: "https://p.scdn.co/mp3-preview/2a49ed0c91463873d7471331456773a4737d9bf2" },
+      { artist: "Paul McCartney", song: "Coming Up - Remastered 2011", uri: "spotify:track:4Ku6X72Q815qNd7ChuiDdD", previewUrl: "https://p.scdn.co/mp3-preview/63bce871a04b7921a33e0425fe8e6bbc5783dcbb" },
+      { artist: "Cortex", song: "Troupeau bleu", uri: "spotify:track:2DTHWr5NK1igQZxctpYTA9", previewUrl: "https://p.scdn.co/mp3-preview/d5d006856ed413a201f1350fe0096987ad6cfa2b" },
+      { artist: "Moacir Santos", song: "Nana", uri: "spotify:track:2O86cNvAra9d9t05RVLW2B", previewUrl: "https://p.scdn.co/mp3-preview/82c10ee9fdde41622a06f7857dc8f33fbcdb4482" },
+      { artist: "Surprise Chef", song: "Leg Day", uri: "spotify:track:73tcaREtlOxh7RnOsy8Lfh", previewUrl: "https://p.scdn.co/mp3-preview/a6d1626aa798e54ffd818e3bbe32b36ad6bc347c" },
+      { artist: "João Donato", song: "A Rã", uri: "spotify:track:0vZwdJBXOGppAMLjwDUNWg", previewUrl: "https://p.scdn.co/mp3-preview/67e5512a8d0a1fc0416e9114bbb29ddc0edd8c9c" }
+    ]
+  };
+
+  /* ---------- Posição na playlist (lembrada entre visitas) ---------- */
+  var KEY = "avatarPlayer.v1";
+  function startIndex(cfg) {
+    // Nova visita: segue para a faixa seguinte à última que tocou. Se faz muito tempo, volta para a primeira.
+    try {
+      var saved = JSON.parse(localStorage.getItem(KEY) || "null");
+      if (saved && typeof saved.i === "number" && Date.now() - saved.t < cfg.resetAfterMs) {
+        return (saved.i + 1) % cfg.tracks.length;
+      }
+    } catch (e) {}
+    return 0;
+  }
+  function remember(i) {
+    try { localStorage.setItem(KEY, JSON.stringify({ i: i, t: Date.now() })); } catch (e) {}
+  }
+
+  /* ---------- Motor 1: HTMLAudioElement ---------- */
+  function PreviewEngine(cfg) {
+    var tracks = cfg.tracks, i = startIndex(cfg), trackCb = function () {}, failCb = function () {};
+    var audio = new Audio();
+    audio.preload = "auto";
+    audio.volume = cfg.volume;
+    function load(n) {
+      i = (n + tracks.length) % tracks.length;
+      audio.src = tracks[i].previewUrl;
+      trackCb(tracks[i]);
+    }
+    audio.addEventListener("ended", function () { load(i + 1); remember(i); audio.play().catch(function () {}); });
+    audio.addEventListener("error", function () { failCb(); });
+    load(i);
+    return {
+      name: "preview",
+      current: function () { return tracks[i]; },
+      // Sempre começa a faixa do início
+      play: function () { try { audio.currentTime = 0; } catch (e) {} remember(i); return audio.play(); },
+      pause: function () { audio.pause(); },
+      onTrack: function (cb) { trackCb = cb; cb(tracks[i]); },
+      onFail: function (cb) { failCb = cb; },
+      destroy: function () { audio.pause(); audio.removeAttribute("src"); audio.load(); }
+    };
+  }
+
+  /* ---------- Motor 2: Spotify IFrame API ---------- */
+  function SpotifyEngine(cfg) {
+    var ctrl = null, ready = false, wantPlay = false, idx = startIndex(cfg), cur = cfg.tracks[idx], advancing = false;
+    var loaded = cur.uri, started = false; // faixa que o iframe tem carregada; já tocou alguma vez?
+    var trackCb = function () {}, failCb = function () {};
+    var host = document.createElement("div");
+    host.setAttribute("aria-hidden", "true");
+    host.style.cssText = "position:fixed;left:0;bottom:0;width:1px;height:1px;opacity:0;pointer-events:none;overflow:hidden";
+    var mount = document.createElement("div");
+    host.appendChild(mount);
+    document.body.appendChild(host);
+
+    function byUri(uri) {
+      for (var k = 0; k < cfg.tracks.length; k++) if (cfg.tracks[k].uri === uri) return cfg.tracks[k];
+      return null;
+    }
+    function init(IFrameAPI) {
+      IFrameAPI.createController(mount, { uri: cur.uri, width: 1, height: 1 }, function (c) {
+        ctrl = c;
+        ctrl.addListener("ready", function () { ready = true; if (wantPlay) { started = true; ctrl.play(); } });
+        ctrl.addListener("playback_update", function (e) {
+          var d = (e && e.data) || {};
+          var t = d.playingURI && byUri(d.playingURI);
+          if (t && t !== cur) { cur = t; loaded = t.uri; idx = cfg.tracks.indexOf(t); remember(idx); trackCb(t); }
+          // Chegou ao fim da faixa: segue a ordem da playlist, e depois da última volta para a primeira
+          if (d.position < 2000) advancing = false;
+          if (d.duration && d.position >= d.duration - 500 && !advancing && wantPlay) {
+            advancing = true;
+            idx = (idx + 1) % cfg.tracks.length; cur = cfg.tracks[idx]; loaded = cur.uri; remember(idx); trackCb(cur);
+            ctrl.loadUri(cur.uri); ctrl.play();
+          }
+        });
+        ctrl.addListener("account_error", function () { failCb(); });
+      });
+    }
+    if (window.__spIframeApi) init(window.__spIframeApi);
+    else {
+      window.onSpotifyIframeApiReady = function (api) { window.__spIframeApi = api; init(api); };
+      var s = document.createElement("script");
+      s.src = "https://open.spotify.com/embed/iframe-api/v1";
+      s.async = true;
+      s.onerror = function () { failCb(); };
+      document.head.appendChild(s);
+    }
+    return {
+      name: "spotify",
+      current: function () { return cur; },
+      play: function () {
+        wantPlay = true; remember(idx);
+        if (ctrl && ready) {
+          if (loaded !== cur.uri) { loaded = cur.uri; ctrl.loadUri(cur.uri); ctrl.play(); }
+          else if (started) { // já tocou: recomeça a faixa do início, sem recarregar o iframe
+            try { if (ctrl.restart) ctrl.restart(); else { ctrl.seek(0); ctrl.resume(); } } catch (e) { ctrl.play(); }
+          } else ctrl.play();
+          started = true;
+        }
+        return Promise.resolve();
+      },
+      pause: function () { wantPlay = false; if (ctrl && ready) ctrl.pause(); },
+      onTrack: function (cb) { trackCb = cb; cb(cur); },
+      onFail: function (cb) { failCb = cb; },
+      destroy: function () { try { if (ctrl) ctrl.destroy(); } catch (e) {} host.remove(); }
+    };
+  }
+
+  /* ---------- Controlador da interface ---------- */
+  function AvatarPlayer(root, cfg) {
+    var btn = root.querySelector(".sp-av-btn");
+    var bubble = root.querySelector(".sp-bubble");
+    var label = root.querySelector(".sp-bubble-text");
+    var isPinned = false, engine = null, playing = false;
+
+    function render(t) { if (t) label.textContent = t.artist + " - " + t.song; }
+    var tried = {};
+    function setEngine(name) {
+      tried[name] = true;
+      if (engine) engine.destroy();
+      engine = name === "spotify" ? SpotifyEngine(cfg) : PreviewEngine(cfg);
+      engine.onTrack(render);
+      engine.onFail(function () {
+        var from = engine.name, live = bubble.classList.contains("on");
+        if (tried[from === "spotify" ? "preview" : "spotify"]) return;
+        setEngine(from === "spotify" ? "preview" : "spotify");
+        if (live) engine.play();
+      });
+    }
+    function show() { bubble.classList.add("on"); }
+    function hide() { bubble.classList.remove("on"); }
+    function start() {
+      show();
+      if (playing) return; // já tocando (ex.: começou no hover e agora foi fixado com o clique): não recomeça a faixa
+      playing = true;
+      var p = engine.play();
+      if (p && p.catch) p.catch(function () { /* o navegador só libera som depois de um clique na página */ });
+    }
+    function stop() { playing = false; engine.pause(); hide(); }
+    function sync() { btn.setAttribute("aria-pressed", String(isPinned)); }
+
+    btn.addEventListener("mouseenter", function () { if (!isPinned) start(); });
+    btn.addEventListener("mouseleave", function () { if (!isPinned) stop(); });
+    btn.addEventListener("click", function () {
+      if (!isPinned) { isPinned = true; start(); }
+      else { isPinned = false; stop(); }
+      sync();
+    });
+    document.addEventListener("keydown", function (e) { if (e.key === "Escape" && isPinned) { isPinned = false; stop(); sync(); } });
+
+    setEngine(cfg.engine);
+    sync();
+    return { get isPinned() { return isPinned; } };
+  }
+
+  function boot() {
+    var root = document.querySelector("[data-avatar-player]");
+    if (!root) return;
+    window.avatarPlayer = AvatarPlayer(root, CONFIG);
+  }
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", boot);
+  else boot();
+})();
